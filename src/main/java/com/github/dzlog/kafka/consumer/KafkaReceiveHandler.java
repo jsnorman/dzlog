@@ -3,7 +3,7 @@ package com.github.dzlog.kafka.consumer;
 import com.gitee.bee.core.conf.BeeConfigClient;
 import com.github.dzlog.entity.LogCollectMetric;
 import com.github.dzlog.kafka.LogEvent;
-import com.github.dzlog.kafka.TopicStatusInfo;
+import com.github.dzlog.kafka.TopicConsumerInfo;
 import com.github.dzlog.service.LogCollectMetricService;
 import com.github.dzlog.util.CommonUtils;
 import com.github.dzlog.writer.AbstractFileWriter;
@@ -52,7 +52,7 @@ public class KafkaReceiveHandler implements Closeable {
     protected String currentPartition = null;
 
     // topic partition 对应的statusInfo
-    protected Map<String, TopicStatusInfo> topicStatusInfoMap = new ConcurrentHashMap<>();
+    protected Map<String, TopicConsumerInfo> partitionToTopicConsumerInfoMap = new ConcurrentHashMap<>();
 
     // topic partition 对应最新消息的 offset`
     protected Map<String, Long> topicPartitionOffsetMap = new ConcurrentHashMap<>();
@@ -88,48 +88,47 @@ public class KafkaReceiveHandler implements Closeable {
         }
     }
 
-    public void flushTopic(String mode, String topicPartition) {
+    public void flushTopic(String mode, String partitionName) {
         long threadId = Thread.currentThread().getId();
 
         // partition 重新分配给其他线程处理。删除遗留未提交的文件。
-        if (!topicPartitionOffsetMap.containsKey(topicPartition)) {
-            if (topicStatusInfoMap.containsKey(topicPartition)) {
-                TopicStatusInfo topicStatusInfo = topicStatusInfoMap.get(topicPartition);
+        if (!topicPartitionOffsetMap.containsKey(partitionName)) {
+            if (partitionToTopicConsumerInfoMap.containsKey(partitionName)) {
+                TopicConsumerInfo topicConsumerInfo = partitionToTopicConsumerInfoMap.get(partitionName);
 
-                Set<String> codes = topicStatusInfo.getCollectCodes();
+                Set<String> codes = topicConsumerInfo.getCollectCodes();
                 for (String code : codes) {
-                    AbstractFileWriter fileWriter = topicStatusInfo.getFileWriter(code);
+                    AbstractFileWriter fileWriter = topicConsumerInfo.getFileWriter(code);
                     if (fileWriter == null) {
                         continue;
                     }
 
                     IOUtils.closeQuietly(fileWriter);
-                    topicStatusInfo.removeFileWriter(code);
-                    LOGGER.info("[{}] [{}] delete file {}", code, topicPartition, fileWriter.getFile());
+                    topicConsumerInfo.removeFileWriter(code);
+                    LOGGER.info("partition 重新平衡，[{}] [{}] 被其他线程重新消费，delete file {}", code, partitionName, fileWriter.getFile());
                     FileUtils.deleteQuietly(new File(fileWriter.getFile().toString()));
                 }
             }
             return;
         }
 
-        if (!topicStatusInfoMap.containsKey(topicPartition)) {
+        if (!partitionToTopicConsumerInfoMap.containsKey(partitionName)) {
             return;
         }
 
         AbstractFileWriter currentWriter = null;
         try {
-            TopicStatusInfo topicStatusInfo = topicStatusInfoMap.get(topicPartition);
-
+            TopicConsumerInfo topicConsumerInfo = partitionToTopicConsumerInfoMap.get(partitionName);
             Boolean isCommit = false;
 
-            for (String code : topicStatusInfo.getCollectCodes()) {
-                currentWriter = topicStatusInfo.getFileWriter(code);
+            for (String code : topicConsumerInfo.getCollectCodes()) {
+                currentWriter = topicConsumerInfo.getFileWriter(code);
                 if (currentWriter == null) {
                     continue;
                 }
 
                 IOUtils.closeQuietly(currentWriter);
-                topicStatusInfo.removeFileWriter(code);
+                topicConsumerInfo.removeFileWriter(code);
 
                 long count = currentWriter.getCount();
                 long msgBytes = currentWriter.getMsgBytes();
@@ -139,17 +138,17 @@ public class KafkaReceiveHandler implements Closeable {
 
                     if (times > 500) {
                         LOGGER.error("[{}] thread {} prepare to flush topicPartition {} (code:{}), times: {}ms, total count: {}, file: {}",
-                                mode, threadId, topicPartition, code, times, count, file);
+                                mode, threadId, partitionName, code, times, count, file);
                     } else if (times > 100) {
                         LOGGER.warn("[{}] thread {} prepare to flush topicPartition {} (code:{}), times: {}ms, total count: {}, file: {}",
-                                mode, threadId, topicPartition, code, times, count, file);
+                                mode, threadId, partitionName, code, times, count, file);
                     } else {
                         LOGGER.info("[{}] thread {} prepare to flush topicPartition {} (code:{}), times: {}ms, total count: {}, file: {}",
-                                mode, threadId, topicPartition, code, times, count, file);
+                                mode, threadId, partitionName, code, times, count, file);
                     }
 
                     synchronized (CODE_LOCK_MAP.get(code)) {
-                        LogCollectMetric entity = collectMetricService.createEntity(code, topicStatusInfo.getCurrentHivePartition(), count, msgBytes);
+                        LogCollectMetric entity = collectMetricService.createEntity(code, topicConsumerInfo.getCurrentHivePartition(), count, msgBytes);
                         collectMetricService.recordEntity(entity);
                     }
                     isCommit = true;
@@ -157,12 +156,12 @@ public class KafkaReceiveHandler implements Closeable {
             }
 
             if (isCommit) {
-                commitTopic(topicPartition);
+                commitTopic(partitionName);
             }
         } catch (Exception e) {
-            ERR_LOGGER.error("flush topicPartition: " + topicPartition, e);
+            ERR_LOGGER.error("flush partitionName: " + partitionName, e);
             if (currentWriter != null) {
-                rollBackTopicPartition(topicPartition);
+                rollBackTopicPartition(partitionName);
             }
         }
     }
@@ -176,15 +175,15 @@ public class KafkaReceiveHandler implements Closeable {
         commits.put(partition, new OffsetAndMetadata(offset + 1));
         consumer.commitSync(commits);
 
-        TopicStatusInfo topicStatusInfo = topicStatusInfoMap.get(topicPartition);
-        topicStatusInfo.setRecordCount(0L);
-        topicStatusInfo.setLastFlushTime(System.currentTimeMillis());
+        TopicConsumerInfo topicConsumerInfo = partitionToTopicConsumerInfoMap.get(topicPartition);
+        topicConsumerInfo.setRecordCount(0L);
+        topicConsumerInfo.setLastFlushTime(System.currentTimeMillis());
         lastCommitPartitionOffsetMap.put(topicPartition, offset + 1);
 
         try {
             long offsetIncrement = getOffsetIncrement(topicPartition);
-            if (topicStatusInfoMap.containsKey(topicPartition)) {
-                long recordCount = topicStatusInfo.getRecordCount();
+            if (partitionToTopicConsumerInfoMap.containsKey(topicPartition)) {
+                long recordCount = topicConsumerInfo.getRecordCount();
                 if (offsetIncrement - recordCount != 0) {
                     ERR_LOGGER.error("[{}] 线程{}消费数据与写入数据相差 {} 条，offsetIncrement:{}, recordCount: {}",
                             topicPartition, threadId, offsetIncrement - recordCount, offsetIncrement, recordCount);
@@ -241,20 +240,20 @@ public class KafkaReceiveHandler implements Closeable {
         String code = logEvent.getCode();
         String topicPartition = logEvent.getTopicPartition();
         try {
-            if (!topicStatusInfoMap.containsKey(topicPartition)) {
-                TopicStatusInfo topicStatusInfo = new TopicStatusInfo(topicPartition);
-                topicStatusInfo.setCurrentHivePartition(currentHivePartition);
-                topicStatusInfoMap.put(topicPartition, topicStatusInfo);
+            if (!partitionToTopicConsumerInfoMap.containsKey(topicPartition)) {
+                TopicConsumerInfo topicConsumerInfo = new TopicConsumerInfo(topicPartition);
+                topicConsumerInfo.setCurrentHivePartition(currentHivePartition);
+                partitionToTopicConsumerInfoMap.put(topicPartition, topicConsumerInfo);
                 CODE_LOCK_MAP.putIfAbsent(code, new Object());
             }
 
-            TopicStatusInfo topicStatusInfo = topicStatusInfoMap.get(topicPartition);
-            topicStatusInfo.setCurrentHivePartition(currentHivePartition);
-            if (topicStatusInfo.getFileWriter(code) == null) {
+            TopicConsumerInfo topicConsumerInfo = partitionToTopicConsumerInfoMap.get(topicPartition);
+            topicConsumerInfo.setCurrentHivePartition(currentHivePartition);
+            if (topicConsumerInfo.getFileWriter(code) == null) {
                 CODE_LOCK_MAP.putIfAbsent(code, new Object());
             }
 
-            AbstractFileWriter fileWriter = topicStatusInfo.getFileWriter(code);
+            AbstractFileWriter fileWriter = topicConsumerInfo.getFileWriter(code);
             if (fileWriter == null) {
                 fileWriter = createNewWriter(code, topicPartition, currentHivePartition);
             } else {
@@ -263,7 +262,7 @@ public class KafkaReceiveHandler implements Closeable {
                 if (lastoffset >= logEvent.getOffset()) {
                     if (fileWriter != null) {
                         IOUtils.closeQuietly(fileWriter);
-                        topicStatusInfo.removeFileWriter(code);
+                        topicConsumerInfo.removeFileWriter(code);
 
                         FileUtils.deleteQuietly(new File(fileWriter.getFile().toString()));
                         LOGGER.info("rollback msg, [{}], lastoffset: {}, currentOffset: {}, delete file {}",
@@ -280,7 +279,7 @@ public class KafkaReceiveHandler implements Closeable {
                 fileWriter.incrementCount();
                 fileWriter.incrementMsgBytes(logEvent.getMsgBytes());
 
-                topicStatusInfo.incrementRecordCount();
+                topicConsumerInfo.incrementRecordCount();
                 LOGGER.debug("append event: " + logEvent);
             }
 
@@ -302,8 +301,8 @@ public class KafkaReceiveHandler implements Closeable {
         AbstractFileWriter newWriter = createWriter(code, topicPartition, partition);
 
         if (newWriter != null) {
-            TopicStatusInfo topicStatusInfo = topicStatusInfoMap.get(topicPartition);
-            topicStatusInfo.setFileWriter(code, newWriter);
+            TopicConsumerInfo topicConsumerInfo = partitionToTopicConsumerInfoMap.get(topicPartition);
+            topicConsumerInfo.setFileWriter(code, newWriter);
         }
 
         return newWriter;
@@ -320,10 +319,10 @@ public class KafkaReceiveHandler implements Closeable {
      */
     public boolean checkTopicForCommit(String topicPartition) {
         boolean flush = false;
-        if (topicStatusInfoMap.containsKey(topicPartition)) {
-            TopicStatusInfo topicStatusInfo = topicStatusInfoMap.get(topicPartition);
-            long cachedCount = topicStatusInfo.getRecordCount();
-            long lastUpdateTime = topicStatusInfo.getLastFlushTime();
+        if (partitionToTopicConsumerInfoMap.containsKey(topicPartition)) {
+            TopicConsumerInfo topicConsumerInfo = partitionToTopicConsumerInfoMap.get(topicPartition);
+            long cachedCount = topicConsumerInfo.getRecordCount();
+            long lastUpdateTime = topicConsumerInfo.getLastFlushTime();
             int commitMaxNum = configClient.getInteger(DZLOG_KAFKA_COMMIT_MAX_NUM);
             int commitMaxIntervalSeconds = configClient.getInteger(DZLOG_KAFKA_COMMIT_MAX_INTERVAL_SECONDS);
 
@@ -374,11 +373,11 @@ public class KafkaReceiveHandler implements Closeable {
         this.currentPartition = currentPartition;
     }
 
-    public Map<String, TopicStatusInfo> getTopicStatusInfoMap() {
-        return topicStatusInfoMap;
+    public Map<String, TopicConsumerInfo> getPartitionToTopicConsumerInfoMap() {
+        return partitionToTopicConsumerInfoMap;
     }
 
-    public void setTopicStatusInfoMap(Map<String, TopicStatusInfo> topicStatusInfoMap) {
-        this.topicStatusInfoMap = topicStatusInfoMap;
+    public void setPartitionToTopicConsumerInfoMap(Map<String, TopicConsumerInfo> partitionToTopicConsumerInfoMap) {
+        this.partitionToTopicConsumerInfoMap = partitionToTopicConsumerInfoMap;
     }
 }

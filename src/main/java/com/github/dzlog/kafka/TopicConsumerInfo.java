@@ -9,7 +9,7 @@ import java.util.Set;
 /**
  * Created by taofu on 2018/1/11.
  */
-public class TopicStatusInfo {
+public class TopicConsumerInfo {
 
 	private String topic;
 
@@ -24,7 +24,7 @@ public class TopicStatusInfo {
 	 */
 	private Map<String, AbstractFileWriter> fileWriterMap = new HashMap<>();
 
-	public TopicStatusInfo(String topic) {
+	public TopicConsumerInfo(String topic) {
 		this.topic = topic;
 	}
 

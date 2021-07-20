@@ -181,8 +181,8 @@ public class KafkaReceiver implements ConsumerSeekAware, ApplicationContextAware
 		String currentHivePartition = TimeUtils.getCurrentDate();
         //到达新的分区
 		if (!StringUtils.equals(currentHivePartition, handler.getCurrentPartition())) {
-			for (String logTopic : handler.getTopicStatusInfoMap().keySet()) {
-				handler.flushTopic("new", logTopic);
+			for (String partitionName : handler.getPartitionToTopicConsumerInfoMap().keySet()) {
+				handler.flushTopic("new", partitionName);
 			}
 			//@TODO dcLogMergeService.reduceCount();
 			handler.setCurrentPartition(currentHivePartition);
@@ -221,10 +221,10 @@ public class KafkaReceiver implements ConsumerSeekAware, ApplicationContextAware
 		KafkaReceiveHandler handler = receiverHandler.get();
 		if (handler != null) {
 			IOUtils.closeQuietly(handler);
-			threadToHandlerMap.remove(threadId);
+		} else {
+			handler = new KafkaReceiveHandler(consumerSeekCallback, applicationContext);
 		}
 
-		handler = new KafkaReceiveHandler(consumerSeekCallback, applicationContext);
 		handler.setCurrentPartition(TimeUtils.getCurrentDate());
 		if (!assignments.isEmpty()) {
 			handler.initAssignment(assignments);
@@ -246,7 +246,7 @@ public class KafkaReceiver implements ConsumerSeekAware, ApplicationContextAware
 		if (!StringUtils.equals(currentPartition, receiverHandler.get().getCurrentPartition())) {
 			mergeFile = true;
 		}
-		for (String topicPartition : receiverHandler.get().getTopicStatusInfoMap().keySet()) {
+		for (String topicPartition : receiverHandler.get().getPartitionToTopicConsumerInfoMap().keySet()) {
 			receiverHandler.get().flushTopic("idle", topicPartition);
 		}
 		if (mergeFile) {
